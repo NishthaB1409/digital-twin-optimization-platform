@@ -1,0 +1,257 @@
+"""Gymnasium environment: an agent retunes the dispatch weights mid-run.
+
+The agent does not schedule jobs directly. It steers the *rule* that schedules
+them -- every ``decision_interval`` hours it reads the state of the floor and
+writes a new 4-weight vector, which takes effect at the very next dispatch.
+
+That framing is deliberate. Picking a job per station per decision would give a
+combinatorial action space that changes shape as queues grow; picking four
+continuous weights gives a fixed ``Box(-1, 1, (4,))`` that PPO/SAC/TD3 handle
+natively, and the resulting policy stays interpretable -- you can read off
+whether it learned to favour short jobs or urgent ones.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Sequence
+
+import gymnasium as gym
+import numpy as np
+from gymnasium import spaces
+
+from ..digital_twin.dispatch import N_FEATURES
+from ..digital_twin.factory import FactoryModel
+from ..utils.config import FactoryConfig, load_config
+
+#: 6 queue lengths + 6 busy fractions + clock, completion, WIP, mean slack.
+OBS_DIM = 16
+
+
+@dataclass(frozen=True)
+class RewardConfig:
+    """Coefficients for the four reward terms.
+
+    Every term is normalised to roughly unit scale before weighting, so these
+    numbers are comparable to each other and a change of factory size does not
+    silently rescale the reward. Day 3 tunes them; the defaults simply put
+    throughput and lateness in tension, which is where scheduling lives.
+    """
+
+    throughput: float = 1.0
+    utilisation: float = 0.3
+    tardiness: float = 1.0
+    #: Applied once, at termination, against the normalised makespan.
+    makespan: float = 0.5
+
+    def __post_init__(self) -> None:
+        if self.tardiness < 0 or self.makespan < 0:
+            raise ValueError("penalty coefficients must be non-negative")
+
+
+class FactorySchedulingEnv(gym.Env):
+    """Tune the composite dispatch rule while the line runs.
+
+    Observation (16-dim, all bounded to [-1, 1]):
+
+    ==========  ====================================================
+    index       meaning
+    ==========  ====================================================
+    0-5         queue length per station, squashed by ``tanh(q / 5)``
+    6-11        busy machines / capacity per station
+    12          clock / expected horizon
+    13          fraction of jobs completed
+    14          WIP / total jobs
+    15          mean due-date slack of WIP, squashed
+    ==========  ====================================================
+
+    Action: the four dispatch weights, in [-1, 1]. See
+    :data:`~dtmo.digital_twin.dispatch.CLASSICAL_RULES` for the corners of that
+    space that correspond to textbook rules.
+    """
+
+    metadata = {"render_modes": ["human"]}
+
+    def __init__(
+        self,
+        config: FactoryConfig | None = None,
+        reward: RewardConfig | None = None,
+        decision_interval: float = 8.0,
+        randomise_seed: bool = True,
+        max_steps: int | None = None,
+    ) -> None:
+        super().__init__()
+        self.config = (config or load_config()).validate()
+        self.reward_config = reward or RewardConfig()
+        if decision_interval <= 0:
+            raise ValueError("decision_interval must be > 0")
+        self.decision_interval = float(decision_interval)
+        self.randomise_seed = randomise_seed
+
+        self.action_space = spaces.Box(
+            low=-1.0, high=1.0, shape=(N_FEATURES,), dtype=np.float32
+        )
+        self.observation_space = spaces.Box(
+            low=-1.0, high=1.0, shape=(OBS_DIM,), dtype=np.float32
+        )
+
+        # Expected time to release every job, plus slack for the line to drain.
+        # Used to normalise the clock and the terminal makespan term.
+        self.horizon = 2.0 * self.config.n_jobs / self.config.arrival_rate
+        self.max_steps = (
+            max_steps
+            if max_steps is not None
+            else int(np.ceil(self.horizon / self.decision_interval))
+        )
+        #: Expected completions per decision interval, for reward scaling.
+        self._completions_per_step = self.config.arrival_rate * self.decision_interval
+        self._slack_scale = float(
+            np.mean([family.planned_work for family in self.config.families])
+        )
+        self._mean_weight = float(
+            np.mean([family.weight for family in self.config.families])
+        )
+
+        self.model = FactoryModel(self.config)
+        self._steps = 0
+        self._prev_completed = 0
+        self._prev_tardiness = 0.0
+        self._prev_busy: dict[str, float] = {}
+
+    # ------------------------------------------------------------------
+    # Gymnasium API
+    # ------------------------------------------------------------------
+    def reset(
+        self,
+        *,
+        seed: int | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        super().reset(seed=seed)
+
+        if seed is not None:
+            episode_seed = int(seed)
+        elif self.randomise_seed:
+            # A fresh job set each episode. Training on one fixed instance
+            # teaches the agent that instance, not scheduling.
+            episode_seed = int(self.np_random.integers(0, 2**31 - 1))
+        else:
+            episode_seed = self.config.seed
+
+        self.model = FactoryModel(self.config, seed=episode_seed)
+        self.model.reset()
+        self._steps = 0
+        self._prev_completed = 0
+        self._prev_tardiness = 0.0
+        self._prev_busy = {name: 0.0 for name in self.model.stations}
+        return self._observation(), self._info()
+
+    def step(
+        self, action: Sequence[float]
+    ) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
+        action = np.clip(
+            np.asarray(action, dtype=np.float64).reshape(-1),
+            self.action_space.low,
+            self.action_space.high,
+        )
+        if action.shape != (N_FEATURES,):
+            raise ValueError(
+                f"expected an action of shape ({N_FEATURES},), got {action.shape}"
+            )
+        self.model.set_weights(action)
+
+        self.model.advance(self.model.now + self.decision_interval)
+        self._steps += 1
+
+        terminated = self.model.is_complete
+        truncated = (not terminated) and self._steps >= self.max_steps
+        reward = self._reward(terminated)
+        return self._observation(), reward, terminated, truncated, self._info()
+
+    def render(self) -> None:
+        print(
+            f"t={self.model.now:7.1f}h  "
+            f"done={len(self.model.completed):3d}/{self.config.n_jobs}  "
+            f"wip={len(self.model.wip):3d}  "
+            f"w={np.round(self.model.dispatcher.weights, 2)}"
+        )
+
+    # ------------------------------------------------------------------
+    # Observation
+    # ------------------------------------------------------------------
+    def _observation(self) -> np.ndarray:
+        stations = [self.model.stations[name] for name in self.config.station_names]
+
+        queues = [np.tanh(station.queue_length / 5.0) for station in stations]
+        busy = [station.busy_machines / station.capacity for station in stations]
+
+        n_jobs = max(1, self.config.n_jobs)
+        clock = min(1.0, self.model.now / self.horizon)
+        completion = len(self.model.completed) / n_jobs
+
+        wip = self.model.wip
+        wip_fraction = len(wip) / n_jobs
+        if wip:
+            mean_slack = float(np.mean([job.slack(self.model.now) for job in wip]))
+            slack = float(np.tanh(mean_slack / self._slack_scale))
+        else:
+            slack = 0.0
+
+        obs = np.array(
+            [*queues, *busy, clock, completion, wip_fraction, slack],
+            dtype=np.float32,
+        )
+        return np.clip(obs, -1.0, 1.0)
+
+    # ------------------------------------------------------------------
+    # Reward
+    # ------------------------------------------------------------------
+    def _reward(self, terminated: bool) -> float:
+        cfg = self.reward_config
+
+        completed = len(self.model.completed)
+        progress = completed - self._prev_completed
+        self._prev_completed = completed
+
+        tardiness = self.model.total_weighted_tardiness
+        new_tardiness = tardiness - self._prev_tardiness
+        self._prev_tardiness = tardiness
+
+        # Time-averaged utilisation over the interval just simulated, rather
+        # than an instantaneous sample -- far less noisy to learn from.
+        busy_delta = 0.0
+        capacity_hours = 0.0
+        for name, station in self.model.stations.items():
+            busy_delta += station.busy_time - self._prev_busy[name]
+            self._prev_busy[name] = station.busy_time
+            capacity_hours += station.capacity * self.decision_interval
+        utilisation = busy_delta / capacity_hours if capacity_hours else 0.0
+
+        reward = (
+            cfg.throughput * (progress / max(self._completions_per_step, 1e-9))
+            + cfg.utilisation * utilisation
+            - cfg.tardiness
+            * (new_tardiness / max(self._mean_weight * self.decision_interval, 1e-9))
+        )
+
+        if terminated:
+            reward -= cfg.makespan * (self.model.makespan / self.horizon)
+        return float(reward)
+
+    # ------------------------------------------------------------------
+    # Diagnostics
+    # ------------------------------------------------------------------
+    def _info(self) -> dict[str, Any]:
+        decisions = sum(s.dispatch_decisions for s in self.model.stations.values())
+        contested = sum(s.contested_decisions for s in self.model.stations.values())
+        info: dict[str, Any] = {
+            "time": self.model.now,
+            "completed": len(self.model.completed),
+            "wip": len(self.model.wip),
+            "weighted_tardiness": self.model.total_weighted_tardiness,
+            "weights": self.model.dispatcher.weights,
+            "contested_fraction": contested / decisions if decisions else 0.0,
+        }
+        if self.model.is_complete:
+            info["kpis"] = self.model.kpis()
+        return info

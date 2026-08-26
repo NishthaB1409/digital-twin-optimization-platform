@@ -1,0 +1,96 @@
+# 6-station aerospace line. Times are in hours.
+#
+# These numbers are tuned, not guessed. The first draft ran at 61% utilisation
+# with mean queues below 0.7, and all seven classical rules landed within 4% of
+# each other -- because a dispatch rule only decides anything when two or more
+# jobs are waiting, and queues that shallow are almost always empty or single.
+#
+# Three changes fixed it:
+#   1. Capacity matched to work content. Machining carries 6.36 h/job and
+#      Inspection 2.57, so they are sized 3 and 1 rather than 4 and 2. Fewer
+#      parallel machines at the same utilisation means deeper queues -- server
+#      pooling is what was flattening the decisions.
+#   2. processing_cv 0.15 -> 0.50. Aerospace work has rework, tooling issues and
+#      inspection failures; near-deterministic times are what kept queues short.
+#   3. Due dates tightened ~30%, moving on-time rate from 99% into the 60-70%
+#      band where being late is a real cost the scheduler can trade against.
+#
+# Result: bottlenecks at ~89%, congested but stable, ~36% of dispatches
+# genuinely contested, and ~12% weighted-tardiness headroom for a tuned weight
+# vector over the best classical rule. Deliberately NOT overloaded -- above
+# ~100% load the queue grows without bound and no scheduling rule can help.
+
+simulation:
+  n_jobs: 120
+  arrival_rate: 0.34      # jobs released per hour (exponential interarrivals)
+  processing_cv: 0.50     # lognormal noise on processing times; 0 = deterministic
+  seed: 42
+
+dispatch:
+  # [processing_time, slack, remaining_work, waiting_time]
+  # Lower score dispatches first, so this default is plain SPT.
+  weights: [1.0, 0.0, 0.0, 0.0]
+
+# Expected load at the settings above: Machining 72%, Composite Layup 57%,
+# Heat Treatment 89%, Surface Treatment 89%, Assembly 79%, Inspection 87%.
+# `scripts/run_simulation.py` prints this analytically before simulating.
+stations:
+  - {name: Machining,         capacity: 3}
+  - {name: Composite Layup,   capacity: 2}
+  - {name: Heat Treatment,    capacity: 2}
+  - {name: Surface Treatment, capacity: 1}   # single anodising line
+  - {name: Assembly,          capacity: 2}
+  - {name: Inspection,        capacity: 1}   # single CMM cell
+
+families:
+  - name: Wing Spar
+    mix: 0.22
+    weight: 3.0           # tardiness weight
+    due_factor: 1.75      # due = release + due_factor * planned work
+    route:
+      - {station: Machining,         mean_time: 8.0}
+      - {station: Heat Treatment,    mean_time: 6.0}
+      - {station: Surface Treatment, mean_time: 4.0}
+      - {station: Assembly,          mean_time: 5.0}
+      - {station: Inspection,        mean_time: 2.5}
+
+  - name: Fuselage Panel
+    mix: 0.24
+    weight: 2.0
+    due_factor: 1.82
+    route:
+      - {station: Composite Layup,   mean_time: 10.0}
+      - {station: Heat Treatment,    mean_time: 7.0}
+      - {station: Surface Treatment, mean_time: 3.5}
+      - {station: Inspection,        mean_time: 2.0}
+
+  - name: Landing Gear
+    mix: 0.18
+    weight: 4.0           # safety-critical, hurts most when late
+    due_factor: 1.54
+    route:
+      - {station: Machining,         mean_time: 12.0}
+      - {station: Heat Treatment,    mean_time: 8.0}
+      - {station: Surface Treatment, mean_time: 5.0}
+      - {station: Assembly,          mean_time: 6.0}
+      - {station: Inspection,        mean_time: 3.0}
+
+  - name: Avionics Bay
+    mix: 0.20
+    weight: 2.5
+    due_factor: 2.10
+    route:
+      - {station: Machining,  mean_time: 5.0}
+      - {station: Assembly,   mean_time: 7.0}
+      - {station: Inspection, mean_time: 3.0}
+
+  - name: Engine Mount
+    mix: 0.16
+    weight: 3.5
+    due_factor: 1.68
+    route:
+      - {station: Machining,       mean_time: 9.0}
+      - {station: Composite Layup, mean_time: 6.0}
+      - {station: Heat Treatment,  mean_time: 5.0}
+      - {station: Assembly,        mean_time: 6.5}
+      - {station: Inspection,      mean_time: 2.5}
