@@ -167,18 +167,22 @@ class TestActions:
     def test_out_of_range_actions_are_clipped_not_rejected(self, env):
         env.reset(seed=0)
         env.step(np.array([5.0, -5.0, 5.0, -5.0], dtype=np.float32))
-        assert env.model.dispatcher.weights == pytest.approx([1.0, -1.0, 1.0, -1.0])
+        # Clipped to the corner, then projected onto the unit sphere.
+        assert env.model.dispatcher.weights == pytest.approx(
+            [0.5, -0.5, 0.5, -0.5], abs=1e-6
+        )
 
     def test_wrong_shape_action_is_an_error(self, env):
         env.reset(seed=0)
         with pytest.raises(ValueError, match="shape"):
             env.step(np.array([1.0, 0.0], dtype=np.float32))
 
-    def test_action_reaches_the_dispatch_rule(self, env):
+    def test_action_reaches_the_dispatch_rule_as_a_direction(self, env):
         env.reset(seed=0)
         action = np.array([0.2, -0.4, 0.6, -0.8], dtype=np.float32)
         env.step(action)
-        assert env.model.dispatcher.weights == pytest.approx(action, abs=1e-6)
+        weights = env.model.dispatcher.weights
+        assert weights == pytest.approx(action / np.linalg.norm(action), abs=1e-6)
 
     def test_weights_can_change_between_steps(self, env):
         env.reset(seed=0)
@@ -187,6 +191,64 @@ class TestActions:
         lpt = np.array(CLASSICAL_RULES["lpt"], dtype=np.float32)
         env.step(lpt)
         assert env.model.dispatcher.weights == pytest.approx(lpt)
+
+
+class TestActionNormalisation:
+    """Magnitude is a dead dimension; the env projects it away.
+
+    The dispatch rule takes an argmin over `w . x`, so a positive rescaling of
+    every weight cannot change the chosen job. Normalising costs nothing and
+    stops the agent burning capacity on a direction that does not exist.
+    """
+
+    def test_scaling_an_action_yields_the_same_weights(self, env):
+        """The invariant that matters: same direction in, same rule out."""
+        direction = np.array([0.6, 0.2, -0.3, 0.1], dtype=np.float32)
+        seen = []
+        for scale in (0.25, 0.5, 1.0, 1.6):
+            env.reset(seed=4)
+            env.step(np.clip(direction * scale, -1.0, 1.0).astype(np.float32))
+            seen.append(env.model.dispatcher.weights)
+        for weights in seen[1:]:
+            assert weights == pytest.approx(seen[0], abs=1e-6)
+
+    def test_scaling_an_action_does_not_change_the_episode(self, config):
+        # Powers of two only: they rescale float32 exactly, so any difference
+        # here is a logic error rather than a rounding difference that flips a
+        # near-tie in argmin and then diverges over the episode.
+        env = FactorySchedulingEnv(config=config, randomise_seed=False)
+        direction = np.array([0.5, 0.25, -0.25, 0.125], dtype=np.float32)
+        returns = [
+            rollout(env, (direction * scale).astype(np.float32), seed=4)[1]
+            for scale in (0.5, 1.0, 2.0)
+        ]
+        assert returns[0] == pytest.approx(returns[1])
+        assert returns[1] == pytest.approx(returns[2])
+
+    def test_weights_are_unit_norm(self, env):
+        env.reset(seed=0)
+        env.step(np.array([0.3, 0.1, -0.2, 0.05], dtype=np.float32))
+        assert np.linalg.norm(env.model.dispatcher.weights) == pytest.approx(1.0)
+
+    def test_classical_rules_are_unchanged_by_normalisation(self, env):
+        """SPT and friends are already unit vectors, so they survive intact."""
+        env.reset(seed=0)
+        env.step(SPT)
+        assert env.model.dispatcher.weights == pytest.approx(SPT, abs=1e-6)
+
+    def test_a_zero_action_is_passed_through(self, env):
+        env.reset(seed=0)
+        env.step(np.zeros(4, dtype=np.float32))
+        assert env.model.dispatcher.weights == pytest.approx([0.0, 0.0, 0.0, 0.0])
+
+    def test_normalisation_can_be_disabled(self, config):
+        env = FactorySchedulingEnv(
+            config=config, randomise_seed=False, normalise_action=False
+        )
+        env.reset(seed=0)
+        action = np.array([0.3, 0.1, -0.2, 0.05], dtype=np.float32)
+        env.step(action)
+        assert env.model.dispatcher.weights == pytest.approx(action, abs=1e-6)
 
 
 class TestReward:
@@ -224,6 +286,87 @@ class TestReward:
     def test_negative_penalties_are_rejected(self):
         with pytest.raises(ValueError, match="non-negative"):
             RewardConfig(tardiness=-1.0)
+
+
+class TestPotentialShaping:
+    """Shaping must fix credit assignment without moving the objective.
+
+    Weighted tardiness only lands when a job finishes, long after the dispatch
+    that caused it, so the raw per-step reward is myopic: measured on this
+    line, the early-reward ranking of dispatch rules was the reverse of their
+    full-episode ranking, and PPO followed it into the worst rule of the four.
+
+    Shaping charges projected lateness as it accrues. Because the potential is
+    zero on an empty floor -- true at both ends of an episode -- it telescopes
+    away and total return is untouched. That invariant is what makes the
+    shaping safe, so it is what these tests guard.
+    """
+
+    def _episode_return(self, config, shaping, action, seed):
+        env = FactorySchedulingEnv(
+            config=config, randomise_seed=False, reward=RewardConfig(shaping=shaping)
+        )
+        return rollout(env, action, seed=seed)[1]
+
+    @pytest.mark.parametrize("rule", ["spt", "lwkr", "mwkr"])
+    def test_total_return_is_unchanged(self, config, rule):
+        action = np.array(CLASSICAL_RULES[rule], dtype=np.float32)
+        off = self._episode_return(config, 0.0, action, seed=1000)
+        on = self._episode_return(config, 1.0, action, seed=1000)
+        assert on == pytest.approx(off, abs=1e-9)
+
+    def test_any_shaping_coefficient_preserves_total_return(self, config):
+        action = np.array(CLASSICAL_RULES["spt"], dtype=np.float32)
+        base = self._episode_return(config, 0.0, action, seed=1001)
+        for coefficient in (0.5, 1.0, 4.0):
+            assert self._episode_return(
+                config, coefficient, action, seed=1001
+            ) == pytest.approx(base, abs=1e-9)
+
+    def test_potential_is_zero_on_an_empty_floor(self, config):
+        env = FactorySchedulingEnv(config=config, randomise_seed=False)
+        env.reset(seed=1000)
+        assert env._potential() == pytest.approx(0.0)
+
+    def test_potential_is_never_positive(self, config):
+        """It measures lateness, which is a cost."""
+        env = FactorySchedulingEnv(config=config, randomise_seed=False)
+        env.reset(seed=1000)
+        for _ in range(25):
+            env.step(np.array(CLASSICAL_RULES["mwkr"], dtype=np.float32))
+            assert env._potential() <= 1e-12
+
+    def test_shaping_penalises_a_late_running_rule_early(self, config):
+        """MWKR piles up projected lateness; shaping should say so at once.
+
+        This is the behaviour that broke the myopia trap: without shaping the
+        early reward barely separates a good rule from a disastrous one.
+        """
+        mwkr = np.array(CLASSICAL_RULES["mwkr"], dtype=np.float32)
+        spt = np.array(CLASSICAL_RULES["spt"], dtype=np.float32)
+
+        def partial(shaping, action, steps=15):
+            env = FactorySchedulingEnv(
+                config=config,
+                randomise_seed=False,
+                reward=RewardConfig(shaping=shaping),
+            )
+            observation, _ = env.reset(seed=1000)
+            total = 0.0
+            for _ in range(steps):
+                observation, reward, terminated, truncated, _ = env.step(action)
+                total += reward
+                if terminated or truncated:
+                    break
+            return total
+
+        gap_unshaped = partial(0.0, spt) - partial(0.0, mwkr)
+        gap_shaped = partial(1.0, spt) - partial(1.0, mwkr)
+        assert gap_shaped > gap_unshaped
+
+    def test_negative_shaping_is_rejected(self):
+        with pytest.raises(ValueError, match="shaping"):
+            RewardConfig(shaping=-1.0)
 
 
 class TestConstruction:

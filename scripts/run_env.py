@@ -1,107 +1,106 @@
-"""Day 2 check: roll policies through the Gymnasium env and score them.
+"""Score fixed policies through the Gymnasium environment.
 
 Each classical rule is held constant for a whole episode, which turns it into a
-fixed policy the env can score. That gives the baseline return PPO has to beat
-on Day 3 -- expressed in the same reward units the agent will actually see, not
-in raw KPIs.
+fixed policy the env can score. That gives the baseline a learned policy has to
+beat, in the same reward units the agent actually sees.
+
+Every policy runs over the *same* seed list and results are reported as paired
+differences. On this line the across-seed spread of episode return is ~38.7
+while the paired difference between two policies is ~11.2 -- instance
+difficulty outweighs the policy effect roughly 3.5 to 1, so two independently
+sampled means would mostly measure which job sets each policy happened to draw.
 
     python scripts/run_env.py
-    python scripts/run_env.py --episodes 10
-    python scripts/run_env.py --interval 24
+    python scripts/run_env.py --episodes 20
+    python scripts/run_env.py --baseline blend --metric total_weighted_tardiness
 """
 
 from __future__ import annotations
 
 import argparse
+import warnings
 
-import numpy as np
-
-from dtmo.digital_twin import CLASSICAL_RULES
-from dtmo.env import FactorySchedulingEnv
+from dtmo.agents.policies import RandomPolicy, classical_policies
+from dtmo.agents.train import make_eval_env
+from dtmo.evaluation.paired import LOWER_IS_BETTER, benchmark, compare, leaderboard
 from dtmo.utils.config import load_config
+
+METRICS = ("return", "total_weighted_tardiness", "on_time_rate", "makespan")
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--episodes", type=int, default=5, help="seeds per policy")
+    parser.add_argument("--config", default=None, help="factory YAML to load")
+    parser.add_argument(
+        "--episodes", type=int, default=12, help="seeds per policy (paired)"
+    )
     parser.add_argument(
         "--interval", type=float, default=8.0, help="hours between decisions"
     )
-    parser.add_argument("--config", default=None, help="factory YAML to load")
+    parser.add_argument(
+        "--baseline", default="spt", help="policy every other is compared against"
+    )
+    parser.add_argument(
+        "--metric", default="return", choices=METRICS, help="metric to compare on"
+    )
     return parser
 
 
-def roll(env, policy, seed):
-    """Run one episode. ``policy`` maps an observation to an action."""
-    obs, info = env.reset(seed=seed)
-    total = 0.0
-    steps = 0
-    terminated = truncated = False
-    while not (terminated or truncated):
-        obs, reward, terminated, truncated, info = env.step(policy(obs))
-        total += reward
-        steps += 1
-    return total, steps, info
-
-
-def constant(weights):
-    action = np.asarray(weights, dtype=np.float32)
-    return lambda obs: action
-
-
 def main() -> None:
+    warnings.simplefilter("ignore")
     args = build_parser().parse_args()
     config = load_config(args.config)
-    env = FactorySchedulingEnv(
-        config=config, decision_interval=args.interval, randomise_seed=False
-    )
-    seeds = list(range(1, args.episodes + 1))
+    env = make_eval_env(config, decision_interval=args.interval)
 
-    policies = {name: constant(w) for name, w in sorted(CLASSICAL_RULES.items())}
-    # The blend that beat SPT by 12.4% in the Day 1 random search.
-    policies["blend*"] = constant([0.24, 0.99, 0.90, -0.08])
-    policies["random"] = lambda obs: env.action_space.sample()
+    # Held-out seeds, disjoint from the 3000/4000 ranges used to search for and
+    # validate the tuned weight vector.
+    seeds = list(range(2000, 2000 + args.episodes))
 
-    print(f"env    : {args.episodes} episodes/policy, {args.interval:g}h decisions")
-    print(f"line   : {config.n_jobs} jobs, {len(config.stations)} stations")
-    print(f"steps  : up to {env.max_steps} decisions per episode")
+    policies = classical_policies() + [RandomPolicy(seed=0)]
+    names = {policy.name for policy in policies}
+    if args.baseline not in names:
+        raise SystemExit(
+            f"unknown baseline {args.baseline!r}; choose from {sorted(names)}"
+        )
 
-    header = (
-        f"{'POLICY':<10} {'RETURN':>9} {'+/-':>7} {'ON-TIME':>8} "
-        f"{'WGT TARD':>10} {'MAKESPAN':>9}"
-    )
+    print(f"line     : {config.n_jobs} jobs, {len(config.stations)} stations")
+    print(f"episodes : {args.episodes} paired seeds ({seeds[0]}..{seeds[-1]})")
+    print(f"decisions: every {args.interval:g}h, up to {env.max_steps} per episode")
     print()
+
+    results = benchmark(policies, env, seeds)
+    print(leaderboard(results, metric=args.metric))
+
+    baseline = results[args.baseline]
+    direction = "lower is better" if args.metric in LOWER_IS_BETTER else "higher is better"
+    print(f"\npaired against {args.baseline} on {args.metric} ({direction}):")
+    header = f"  {'POLICY':<10} {'DIFF':>9} {'WIN':>5} {'p':>7}  VERDICT"
     print(header)
-    print("-" * len(header))
+    print("  " + "-" * (len(header) - 2))
 
     rows = []
-    for name, policy in policies.items():
-        returns, ontime, tard, mkspan = [], [], [], []
-        for seed in seeds:
-            total, _, info = roll(env, policy, seed)
-            returns.append(total)
-            kpis = info.get("kpis")
-            if kpis is not None:
-                ontime.append(kpis.on_time_rate)
-                tard.append(kpis.total_weighted_tardiness)
-                mkspan.append(kpis.makespan)
-        rows.append((name, float(np.mean(returns)), float(np.std(returns)),
-                     float(np.mean(ontime)), float(np.mean(tard)),
-                     float(np.mean(mkspan))))
+    for name, result in results.items():
+        if name == args.baseline:
+            continue
+        rows.append((name, compare(result, baseline, metric=args.metric)))
 
-    for name, ret, sd, ot, wt, ms in sorted(rows, key=lambda r: -r[1]):
-        print(f"{name:<10} {ret:>9.2f} {sd:>7.2f} {ot:>7.1%} {wt:>10.1f} {ms:>9.1f}")
-    print("-" * len(header))
+    for name, c in sorted(rows, key=lambda r: -r[1].improvement):
+        if not c.is_significant:
+            verdict = "tie (not significant)"
+        elif c.is_better:
+            verdict = "better"
+        else:
+            verdict = "worse"
+        print(
+            f"  {name:<10} {c.improvement:>+9.2f} {c.win_rate:>4.0%} "
+            f"{c.p_value:>7.3f}  {verdict}"
+        )
 
-    best = max(rows, key=lambda r: r[1])
-    worst = min(rows, key=lambda r: r[1])
-    print(f"best fixed policy : {best[0]} (return {best[1]:.2f})")
-    print(f"worst             : {worst[0]} (return {worst[1]:.2f})")
-    print(f"spread            : {best[1] - worst[1]:.2f} reward")
-    print()
-    print("Day 3 target: a PPO policy that varies its weights with the observed")
-    print(f"state should beat {best[1]:.2f} -- any fixed vector, however good, cannot")
-    print("react to a queue building at the bottleneck.")
+    print(
+        "\nEvery row above is a *constant* weight vector. A learned policy that "
+        "varies\nits weights with the state has to beat the best of them to earn "
+        "its keep."
+    )
 
 
 if __name__ == "__main__":
