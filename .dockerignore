@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.git/
+.vscode/
+tests/
+scripts/
+*.exe
+*.log
+runs/*
+!runs/ppo_shaped/
+runs/ppo_shaped/history.json

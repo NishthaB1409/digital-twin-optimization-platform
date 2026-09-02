@@ -1,0 +1,10 @@
+services:
+  api:
+    build: .
+    image: dtmo-serving:latest
+    ports:
+      - "8000:8000"
+    environment:
+      DTMO_CONFIG: /app/configs/factory.yaml
+      DTMO_MODEL: /app/runs/ppo_shaped/ppo_best
+    restart: unless-stopped

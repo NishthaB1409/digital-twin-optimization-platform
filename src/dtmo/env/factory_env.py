@@ -27,6 +27,50 @@ from ..utils.config import FactoryConfig, load_config
 #: 6 queue lengths + 6 busy fractions + clock, completion, WIP, mean slack.
 OBS_DIM = 16
 
+#: Queue lengths are squashed by tanh(q / QUEUE_SCALE) so a station with 40
+#: waiting jobs does not saturate the input the way a raw count would.
+QUEUE_SCALE = 5.0
+
+
+def encode_observation(
+    queue_lengths: Sequence[float],
+    busy_fractions: Sequence[float],
+    clock_hours: float,
+    horizon_hours: float,
+    jobs_completed: int,
+    jobs_in_progress: int,
+    total_jobs: int,
+    mean_slack_hours: float,
+    slack_scale: float,
+) -> np.ndarray:
+    """Turn raw floor state into the vector the policy expects.
+
+    The single source of truth for the observation layout. The training
+    environment and the serving API both call this, because a policy served a
+    differently-scaled observation than it trained on is not merely degraded --
+    it is reading noise, and nothing about the response would look wrong.
+    """
+    total = max(1, total_jobs)
+    scale = slack_scale if slack_scale > 0 else 1.0
+    observation = np.array(
+        [
+            *[np.tanh(q / QUEUE_SCALE) for q in queue_lengths],
+            *busy_fractions,
+            min(1.0, clock_hours / horizon_hours) if horizon_hours > 0 else 0.0,
+            jobs_completed / total,
+            jobs_in_progress / total,
+            np.tanh(mean_slack_hours / scale),
+        ],
+        dtype=np.float32,
+    )
+    if observation.shape != (OBS_DIM,):
+        raise ValueError(
+            f"expected {OBS_DIM} features, built {observation.shape[0]} -- "
+            f"got {len(queue_lengths)} queues and {len(busy_fractions)} "
+            "busy fractions"
+        )
+    return np.clip(observation, -1.0, 1.0)
+
 
 @dataclass(frozen=True)
 class RewardConfig:
@@ -233,27 +277,24 @@ class FactorySchedulingEnv(gym.Env):
     # ------------------------------------------------------------------
     def _observation(self) -> np.ndarray:
         stations = [self.model.stations[name] for name in self.config.station_names]
-
-        queues = [np.tanh(station.queue_length / 5.0) for station in stations]
-        busy = [station.busy_machines / station.capacity for station in stations]
-
-        n_jobs = max(1, self.config.n_jobs)
-        clock = min(1.0, self.model.now / self.horizon)
-        completion = len(self.model.completed) / n_jobs
-
         wip = self.model.wip
-        wip_fraction = len(wip) / n_jobs
-        if wip:
-            mean_slack = float(np.mean([job.slack(self.model.now) for job in wip]))
-            slack = float(np.tanh(mean_slack / self._slack_scale))
-        else:
-            slack = 0.0
-
-        obs = np.array(
-            [*queues, *busy, clock, completion, wip_fraction, slack],
-            dtype=np.float32,
+        now = self.model.now
+        mean_slack = (
+            float(np.mean([job.slack(now) for job in wip])) if wip else 0.0
         )
-        return np.clip(obs, -1.0, 1.0)
+        return encode_observation(
+            queue_lengths=[station.queue_length for station in stations],
+            busy_fractions=[
+                station.busy_machines / station.capacity for station in stations
+            ],
+            clock_hours=now,
+            horizon_hours=self.horizon,
+            jobs_completed=len(self.model.completed),
+            jobs_in_progress=len(wip),
+            total_jobs=self.config.n_jobs,
+            mean_slack_hours=mean_slack,
+            slack_scale=self._slack_scale,
+        )
 
     # ------------------------------------------------------------------
     # Reward
