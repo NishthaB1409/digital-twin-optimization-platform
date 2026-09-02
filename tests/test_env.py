@@ -369,6 +369,79 @@ class TestPotentialShaping:
             RewardConfig(shaping=-1.0)
 
 
+class TestPerStationWeights:
+    """One weight vector per station instead of one for the line.
+
+    The hypothesis was that a single-machine bottleneck at ~89% load wants a
+    different rule than a three-machine station at ~72%, and that a shared
+    vector cannot express that. Measured, it does not help -- a fixed
+    per-station search gained +3.80 on its selection seeds and +0.16 held out
+    (p=0.88), and per-station PPO lands significantly *worse* than the shared
+    version. The capability is kept because the negative result is worth having
+    and the baselines still need to run on this env unchanged.
+    """
+
+    @pytest.fixture
+    def per_station_env(self, config):
+        return FactorySchedulingEnv(
+            config=config, randomise_seed=False, per_station=True
+        )
+
+    def test_action_space_grows_with_the_station_count(self, per_station_env, config):
+        assert per_station_env.action_space.shape == (4 * len(config.stations),)
+
+    def test_shared_mode_is_still_four_dimensional(self, env):
+        assert env.action_space.shape == (4,)
+
+    def test_each_station_can_hold_a_different_rule(self, per_station_env, config):
+        per_station_env.reset(seed=1000)
+        action = np.concatenate(
+            [CLASSICAL_RULES["spt"], CLASSICAL_RULES["min_slack"]] * 3
+        ).astype(np.float32)
+        per_station_env.step(action)
+        weights = per_station_env.model.station_weights
+        names = list(config.station_names)
+        assert weights[names[0]] == pytest.approx([1.0, 0.0, 0.0, 0.0])
+        assert weights[names[1]] == pytest.approx([0.0, 1.0, 0.0, 0.0])
+
+    def test_a_four_vector_is_broadcast_to_every_station(self, per_station_env):
+        """Keeps the classical baselines comparable on a per-station line."""
+        per_station_env.reset(seed=1000)
+        per_station_env.step(SPT)
+        for weights in per_station_env.model.station_weights.values():
+            assert weights == pytest.approx(SPT, abs=1e-6)
+
+    def test_each_block_is_normalised_independently(self, per_station_env):
+        """One loud station must not shrink every other station's rule."""
+        per_station_env.reset(seed=1000)
+        action = np.concatenate([[1.0, 1.0, 1.0, 1.0], [0.1, 0.0, 0.0, 0.0]] * 3)
+        per_station_env.step(action.astype(np.float32))
+        for weights in per_station_env.model.station_weights.values():
+            assert np.linalg.norm(weights) == pytest.approx(1.0, abs=1e-6)
+
+    def test_a_broadcast_rule_matches_the_shared_env_exactly(self, config):
+        """SPT everywhere is still SPT, whichever mode the env is in."""
+        shared = FactorySchedulingEnv(config=config, randomise_seed=False)
+        per = FactorySchedulingEnv(
+            config=config, randomise_seed=False, per_station=True
+        )
+        assert rollout(per, SPT, seed=7)[1] == pytest.approx(
+            rollout(shared, SPT, seed=7)[1]
+        )
+
+    def test_a_wrong_length_action_is_rejected(self, per_station_env):
+        per_station_env.reset(seed=1000)
+        with pytest.raises(ValueError, match="shape"):
+            per_station_env.step(np.zeros(9, dtype=np.float32))
+
+    def test_model_rejects_a_bad_weight_count(self, config):
+        from dtmo.digital_twin.factory import FactoryModel
+
+        model = FactoryModel(config)
+        with pytest.raises(ValueError, match="expected 4 weights"):
+            model.set_weights(np.zeros(9))
+
+
 class TestConstruction:
     def test_decision_interval_must_be_positive(self, config):
         with pytest.raises(ValueError, match="decision_interval"):

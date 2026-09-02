@@ -4,6 +4,10 @@
     python scripts/serve.py --model runs/ppo_shaped/ppo_best --reload
     python scripts/serve.py --demo          # no server; exercise it in-process
 
+Once running, http://127.0.0.1:8000/live watches the twin run on a wall clock
+with the policy steering it -- the same control loop a real deployment uses,
+with a simulated floor standing in for the physical one.
+
 Once running, the interactive docs are at http://127.0.0.1:8000/docs
 """
 
@@ -109,7 +113,8 @@ def main() -> None:
 
     import uvicorn
 
-    print(f"docs at http://{args.host}:{args.port}/docs")
+    print(f"  API docs   http://{args.host}:{args.port}/docs")
+    print(f"  LIVE FLOOR http://{args.host}:{args.port}/live")
     uvicorn.run(
         "dtmo.serving.app:app",
         host=args.host,

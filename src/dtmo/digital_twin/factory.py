@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Sequence
 import numpy as np
 import simpy
 
-from .dispatch import CompositeDispatchRule
+from .dispatch import N_FEATURES, CompositeDispatchRule
 from .entities import Job
 from .kpis import KPIs, compute_kpis
 from .stations import Station
@@ -45,9 +45,16 @@ class FactoryModel:
         config.validate()
         self.config = config
         self.seed = config.seed if seed is None else seed
-        self.dispatcher = CompositeDispatchRule(
-            config.dispatch_weights if weights is None else weights
-        )
+        # One rule per station, not one for the line. Stations differ a lot
+        # here -- Surface Treatment has a single machine at ~89% load while
+        # Machining has three at ~72% -- and the rule that suits a bottleneck
+        # is not obviously the rule that suits a station with slack.
+        # `set_weights` broadcasts a single 4-vector across all of them, so the
+        # classical rules and the shared-weight agent behave exactly as before.
+        initial = config.dispatch_weights if weights is None else weights
+        self.dispatchers: dict[str, CompositeDispatchRule] = {
+            spec.name: CompositeDispatchRule(initial) for spec in config.stations
+        }
 
         self.env: simpy.Environment | None = None
         self.stations: dict[str, Station] = {}
@@ -56,6 +63,16 @@ class FactoryModel:
 
     def __repr__(self) -> str:
         return f"FactoryModel(seed={self.seed}, {self.dispatcher!r})"
+
+    @property
+    def dispatcher(self) -> CompositeDispatchRule:
+        """The first station's rule.
+
+        With shared weights every station holds the same vector, so this is
+        the line's rule. With per-station weights it is only the first one --
+        read :attr:`dispatchers` instead.
+        """
+        return next(iter(self.dispatchers.values()))
 
     # ------------------------------------------------------------------
     # Job generation
@@ -117,7 +134,7 @@ class FactoryModel:
             spec.name: Station(
                 env=self.env,
                 spec=spec,
-                dispatcher=self.dispatcher,
+                dispatcher=self.dispatchers[spec.name],
                 on_operation_complete=self._route,
             )
             for spec in self.config.stations
@@ -208,9 +225,29 @@ class FactoryModel:
         return compute_kpis(self.jobs, self.completed, self.stations)
 
     def set_weights(self, weights: Sequence[float]) -> None:
-        """Retune the dispatch rule.
+        """Retune the dispatch rules. Takes effect at the very next dispatch.
 
-        Takes effect at the very next dispatch, so mid-episode retuning works
-        without rebuilding anything.
+        Accepts either 4 weights, applied to every station, or 4 per station in
+        configured station order. Broadcasting is what keeps a classical rule
+        meaningful on a per-station line: SPT everywhere is still SPT.
         """
-        self.dispatcher.weights = weights
+        values = np.asarray(weights, dtype=float).reshape(-1)
+        n_stations = len(self.dispatchers)
+        if values.size == N_FEATURES:
+            for rule in self.dispatchers.values():
+                rule.weights = values
+            return
+        if values.size == N_FEATURES * n_stations:
+            for index, rule in enumerate(self.dispatchers.values()):
+                rule.weights = values[index * N_FEATURES : (index + 1) * N_FEATURES]
+            return
+        raise ValueError(
+            f"expected {N_FEATURES} weights (shared) or "
+            f"{N_FEATURES * n_stations} ({n_stations} stations x {N_FEATURES}), "
+            f"got {values.size}"
+        )
+
+    @property
+    def station_weights(self) -> dict[str, np.ndarray]:
+        """Current weight vector per station."""
+        return {name: rule.weights for name, rule in self.dispatchers.items()}

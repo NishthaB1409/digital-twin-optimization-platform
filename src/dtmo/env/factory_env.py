@@ -72,6 +72,38 @@ def encode_observation(
     return np.clip(observation, -1.0, 1.0)
 
 
+def observe_factory(
+    model: FactoryModel,
+    config: FactoryConfig,
+    horizon_hours: float,
+    slack_scale: float,
+) -> np.ndarray:
+    """Build the policy's observation from a running :class:`FactoryModel`.
+
+    Shared by the training environment and the live service, so a policy driving
+    a real-time run sees exactly the vector it trained on. Assembling this twice
+    is how train/serve skew gets in -- the model would read noise and every
+    response would still look well-formed.
+    """
+    stations = [model.stations[name] for name in config.station_names]
+    wip = model.wip
+    now = model.now
+    mean_slack = float(np.mean([job.slack(now) for job in wip])) if wip else 0.0
+    return encode_observation(
+        queue_lengths=[station.queue_length for station in stations],
+        busy_fractions=[
+            station.busy_machines / station.capacity for station in stations
+        ],
+        clock_hours=now,
+        horizon_hours=horizon_hours,
+        jobs_completed=len(model.completed),
+        jobs_in_progress=len(wip),
+        total_jobs=config.n_jobs,
+        mean_slack_hours=mean_slack,
+        slack_scale=slack_scale,
+    )
+
+
 @dataclass(frozen=True)
 class RewardConfig:
     """Coefficients for the reward terms.
@@ -146,6 +178,7 @@ class FactorySchedulingEnv(gym.Env):
         randomise_seed: bool = True,
         max_steps: int | None = None,
         normalise_action: bool = True,
+        per_station: bool = False,
     ) -> None:
         super().__init__()
         self.config = (config or load_config()).validate()
@@ -155,9 +188,18 @@ class FactorySchedulingEnv(gym.Env):
         self.decision_interval = float(decision_interval)
         self.randomise_seed = randomise_seed
         self.normalise_action = normalise_action
+        # One weight vector per station instead of one for the line. The
+        # stations are not alike -- a single-machine bottleneck at 89% load
+        # and a three-machine station at 72% plausibly want different rules --
+        # and a shared vector cannot express that at all.
+        self.per_station = per_station
+        self.n_blocks = len(self.config.stations) if per_station else 1
 
         self.action_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(N_FEATURES,), dtype=np.float32
+            low=-1.0,
+            high=1.0,
+            shape=(N_FEATURES * self.n_blocks,),
+            dtype=np.float32,
         )
         self.observation_space = spaces.Box(
             low=-1.0, high=1.0, shape=(OBS_DIM,), dtype=np.float32
@@ -220,14 +262,18 @@ class FactorySchedulingEnv(gym.Env):
     def step(
         self, action: Sequence[float]
     ) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
+        # Clip to scalars, not the space's bounds: a broadcast 4-vector has a
+        # different length than the 24-dim bounds arrays would.
         action = np.clip(
-            np.asarray(action, dtype=np.float64).reshape(-1),
-            self.action_space.low,
-            self.action_space.high,
+            np.asarray(action, dtype=np.float64).reshape(-1), -1.0, 1.0
         )
-        if action.shape != (N_FEATURES,):
+        # A 4-vector is always accepted and broadcast across every station, so
+        # a classical rule stays exactly itself on a per-station line and the
+        # baselines remain comparable.
+        if action.shape not in {(N_FEATURES,), self.action_space.shape}:
             raise ValueError(
-                f"expected an action of shape ({N_FEATURES},), got {action.shape}"
+                f"expected an action of shape {self.action_space.shape} "
+                f"or ({N_FEATURES},), got {action.shape}"
             )
         self.model.set_weights(self._to_weights(action))
 
@@ -259,10 +305,13 @@ class FactorySchedulingEnv(gym.Env):
         """
         if not self.normalise_action:
             return action
-        norm = float(np.linalg.norm(action))
-        if norm < 1e-6:
-            return action
-        return action / norm
+        # Each station's block is its own rule and is scale-invariant on its
+        # own, so normalise per block rather than across the whole vector --
+        # otherwise one loud station would shrink every other station's rule.
+        blocks = action.reshape(-1, N_FEATURES)
+        norms = np.linalg.norm(blocks, axis=1, keepdims=True)
+        scaled = np.where(norms < 1e-6, blocks, blocks / np.maximum(norms, 1e-12))
+        return scaled.reshape(action.shape)
 
     def render(self) -> None:
         print(
@@ -276,24 +325,8 @@ class FactorySchedulingEnv(gym.Env):
     # Observation
     # ------------------------------------------------------------------
     def _observation(self) -> np.ndarray:
-        stations = [self.model.stations[name] for name in self.config.station_names]
-        wip = self.model.wip
-        now = self.model.now
-        mean_slack = (
-            float(np.mean([job.slack(now) for job in wip])) if wip else 0.0
-        )
-        return encode_observation(
-            queue_lengths=[station.queue_length for station in stations],
-            busy_fractions=[
-                station.busy_machines / station.capacity for station in stations
-            ],
-            clock_hours=now,
-            horizon_hours=self.horizon,
-            jobs_completed=len(self.model.completed),
-            jobs_in_progress=len(wip),
-            total_jobs=self.config.n_jobs,
-            mean_slack_hours=mean_slack,
-            slack_scale=self._slack_scale,
+        return observe_factory(
+            self.model, self.config, self.horizon, self._slack_scale
         )
 
     # ------------------------------------------------------------------

@@ -269,3 +269,10 @@ def policies() -> dict[str, Any]:
         },
         "tuned": {"blend": dict(zip(FEATURE_NAMES, BEST_KNOWN_BLEND))},
     }
+
+
+# Registered last: live_routes imports get_config and named_policy from this
+# module, so the import has to happen after they exist.
+from .live_routes import router as live_router  # noqa: E402
+
+app.include_router(live_router)

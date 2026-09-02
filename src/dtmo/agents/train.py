@@ -66,6 +66,9 @@ class TrainingConfig:
     #: which also lets `model.predict` take raw observations at eval time.
     normalise_reward: bool = True
 
+    #: One weight vector per station instead of one for the line.
+    per_station: bool = False
+
     eval_freq: int = 20_000
     eval_seeds: tuple[int, ...] = DEFAULT_EVAL_SEEDS
     baseline: str = "spt"
@@ -115,6 +118,7 @@ def make_training_env(
                 reward=reward,
                 decision_interval=decision_interval,
                 randomise_seed=True,
+                per_station=training_config.per_station,
             )
             env = Monitor(env)
             # Seed each worker's episode-seed stream differently, once, so the
@@ -134,13 +138,19 @@ def make_eval_env(
     factory_config: FactoryConfig,
     reward: RewardConfig | None = None,
     decision_interval: float = 8.0,
+    per_station: bool = False,
 ) -> FactorySchedulingEnv:
-    """A raw, unnormalised env -- evaluation reports true rewards and KPIs."""
+    """A raw, unnormalised env -- evaluation reports true rewards and KPIs.
+
+    A per-station env still accepts a 4-vector and broadcasts it, so the
+    classical baselines are scored on exactly the same footing.
+    """
     return FactorySchedulingEnv(
         config=factory_config,
         reward=reward,
         decision_interval=decision_interval,
         randomise_seed=False,
+        per_station=per_station,
     )
 
 
@@ -247,7 +257,9 @@ def train_ppo(
     train_env = make_training_env(
         factory_config, training_config, reward, decision_interval
     )
-    eval_env = make_eval_env(factory_config, reward, decision_interval)
+    eval_env = make_eval_env(
+        factory_config, reward, decision_interval, training_config.per_station
+    )
 
     baseline_policy = baseline_by_name(training_config.baseline)
     baseline = evaluate(baseline_policy, eval_env, training_config.eval_seeds)
