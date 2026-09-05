@@ -22,7 +22,7 @@ import numpy as np
 from fastapi import FastAPI, HTTPException
 
 from .. import __version__
-from ..agents.policies import BEST_KNOWN_BLEND, ConstantPolicy, SB3Policy
+from ..agents.policies import BEST_KNOWN_BLEND, ConstantPolicy
 from ..digital_twin.dispatch import CLASSICAL_RULES, FEATURE_NAMES
 from ..digital_twin.factory import FactoryModel
 from ..env.factory_env import OBS_DIM, encode_observation
@@ -44,6 +44,10 @@ from .schemas import (
 #: without a model still schedules sensibly.
 MODEL_ENV_VAR = "DTMO_MODEL"
 CONFIG_ENV_VAR = "DTMO_CONFIG"
+#: A numpy export of the same policy. Preferred when present: it needs neither
+#: torch nor Stable-Baselines3, which is ~1.8 GB of image for three matrix
+#: multiplies. Verified against the torch model at export time.
+POLICY_ENV_VAR = "DTMO_POLICY"
 
 
 @lru_cache(maxsize=1)
@@ -53,7 +57,23 @@ def get_config():
 
 @lru_cache(maxsize=1)
 def get_policy() -> tuple[Any, str | None]:
-    """Load the trained policy once, falling back to a fixed rule."""
+    """Load the trained policy once, falling back to a fixed rule.
+
+    Order: the numpy export, then the Stable-Baselines3 model, then the tuned
+    fixed rule. A deployment with no model at all still schedules sensibly
+    rather than refusing to start.
+    """
+    npz = os.environ.get(POLICY_ENV_VAR)
+    if npz and Path(npz).exists():
+        try:
+            from .export import NumpyPolicy
+
+            return NumpyPolicy.load(npz, name="ppo"), npz
+        except Exception:  # noqa: BLE001 -- fall through to the next option
+            pass
+
+    from .policies_lazy import load_sb3_policy as SB3Policy  # noqa: N813
+
     path = os.environ.get(MODEL_ENV_VAR)
     # Stable-Baselines3 saves to "<path>.zip" but loads from either spelling.
     if path and (Path(path).exists() or Path(f"{path}.zip").exists()):

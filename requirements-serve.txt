@@ -1,0 +1,16 @@
+# Serving-only dependencies. No torch, no Stable-Baselines3.
+#
+# The trained policy ships as a numpy export (scripts/export_policy.py), which
+# needs three matrix multiplies rather than a deep-learning framework. Dropping
+# torch and SB3 -- and pandas/matplotlib, which SB3 pulls in transitively --
+# takes the image from ~2.05 GB to a few hundred MB.
+#
+# Train with requirements.txt; serve with this.
+fastapi==0.111.0
+uvicorn==0.30.1
+pydantic==2.7.4
+numpy==1.26.4
+scipy==1.13.1        # the lower bound in /simulate
+simpy==4.1.1         # the digital twin
+gymnasium==0.29.1    # observation encoding lives alongside the env
+pyyaml==6.0.1

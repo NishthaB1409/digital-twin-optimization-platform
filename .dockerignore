@@ -12,3 +12,4 @@ scripts/
 runs/*
 !runs/ppo_shaped/
 runs/ppo_shaped/history.json
+!runs/ppo_shaped/policy.npz

@@ -1,0 +1,47 @@
+# syntax=docker/dockerfile:1
+#
+# Slim serving image: the policy runs in numpy, so neither torch nor
+# Stable-Baselines3 is installed. Build the numpy export first:
+#
+#     python scripts/export_policy.py
+#     docker build -f Dockerfile.serve -t dtmo-serve:slim .
+
+FROM python:3.10-slim AS builder
+
+ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
+WORKDIR /build
+
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+COPY requirements-serve.txt ./
+RUN pip install --upgrade pip && pip install -r requirements-serve.txt
+
+COPY pyproject.toml ./
+COPY src/ ./src/
+RUN pip install --no-deps .
+
+
+FROM python:3.10-slim AS runtime
+
+RUN useradd --create-home --uid 1000 dtmo
+WORKDIR /app
+
+COPY --from=builder /opt/venv /opt/venv
+COPY configs/ ./configs/
+COPY runs/ppo_shaped/policy.npz ./model/policy.npz
+
+ENV PATH="/opt/venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    DTMO_CONFIG=/app/configs/factory.yaml \
+    DTMO_POLICY=/app/model/policy.npz
+
+USER dtmo
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status==200 else 1)"
+
+# Cloud platforms inject $PORT; default to 8000 for local runs.
+CMD ["sh", "-c", "uvicorn dtmo.serving.app:app --host 0.0.0.0 --port ${PORT:-8000}"]
